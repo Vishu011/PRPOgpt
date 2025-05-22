@@ -14,12 +14,57 @@ class IntentAgent:
             2. The main entities/tables that might be involved
             3. Any conditions or filters mentioned
             4. Any aggregation or grouping operations requested
+            5. Use only the schema information provided.
+            6. Do not assume any tables or columns by yourself.
+            *** Use this BELOW TABLE information below to generate the SQL query.
+            The tables with their colomns and datatype in the database are:
+                PO_INVOICE_DATA_DUMMY
+                        PO_NUMBER VARCHAR2(26),
+                        INVOICE_AMOUNT NUMBER(38,2),
+                        INVOICE_NUM VARCHAR2(128),
+                        PAID_AMOUNT NUMBER(38,2),
+                        PAYMENT_NUMBER NUMBER(38),
+                        CURRENCY_CODE VARCHAR2(26),
+                        RECEIVED_QUANTITY NUMBER(38,2),
+                        GRN_AMOUNT NUMBER(38,4),
+                        GRN_NUMBER NUMBER(38),
+                        GRN_STATUS VARCHAR2(26)
+
+                PO_LINE_TABLE_DUMMY
+                        PO_NUM VARCHAR2(256),
+                        ORDERED_AMOUNT NUMBER(38,13),
+                        INVOCIE_NUM VARCHAR2(128),
+                        INVOICED_AMOUNT NUMBER(38,2),
+                        LINE_NUM NUMBER(38),
+                        CURRENCY_CODE VARCHAR2(26),
+                        LINE_STATUS VARCHAR2(26),
+                        ITEM_DESCRIPTION VARCHAR2(1024)
+
+                PO_NORM_TABLE_DUMMY
+                        PO_NUM VARCHAR2(256),
+                        PO_CREATION_DATE DATE,
+                        ORDERED_AMOUNT NUMBER(38,13),
+                        RECEIVED_AMOUNT NUMBER(38,14),
+                        DELIVERED_AMOUNT NUMBER(38,14),
+                        INVOICED_AMOUNT NUMBER(38,2),
+                        REQUISITION_NUMBER VARCHAR2(26),
+                        JF_NUMBER VARCHAR2(26),
+                        CURRENCY_CODE VARCHAR2(26),
+                        PO_STATUS VARCHAR2(26),
+                        DESCRIPTION VARCHAR2(1024),
+                        SUPPLIER_NAME VARCHAR2(128)
+
+                PR_DATA_DUMMY
+                        REQUISTION_NO NUMBER(38),
+                        CREATION_DATE DATE,
+                        CREATED_BY VARCHAR2(26),
+                        REQUISITION_STATUS VARCHAR2(26),
+                        DEPARTMENT VARCHAR2(128)*****
             
             User Query: {query}
             
             Similar SQL examples for reference:
             {sql_examples}
-            
             Provide your analysis in JSON format:
             {{
                 "operation_type": "SELECT|INSERT|UPDATE|DELETE",

@@ -18,7 +18,7 @@ class TableAgent:
             
             Based on the intent and the available tables, determine which tables should be used in the SQL query.
             Do not include tables that don't exist in the available tables list.
-            
+            Dont select tables that are not relevant to the user's query.
             Return your answer in JSON format:
             {{
                 "relevant_tables": ["table1", "table2"],

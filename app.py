@@ -5,7 +5,9 @@ from typing import Dict, Any, List, Optional
 import json
 import logging
 import traceback
-
+import asyncio
+import re
+from datetime import datetime
 # Import our agents
 from agents.intent_agent import IntentAgent
 from agents.table_agent import TableAgent
@@ -14,7 +16,11 @@ from prompts.generate_prompts import QueryPromptGenerator
 from retriever.sql_retriever import retrieve_similar_sql
 from utils.sql_utils import extract_json_from_llm_response, format_sql_query, log_query
 from db.db_pool import init_db_pool, get_connection
-from config import TABLES
+from metadata.schema_loader import SCHEMA_MAP, load_schema
+from sql_examples import SQL_EXAMPLES
+from agents.combined_agents import IntentAndTableAgent
+# Define available tables from schema map
+TABLES = list(SCHEMA_MAP.keys())
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +38,7 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     sql: str
     explanation: str
+    results: List[Dict[str, Any]] = []
     debug_info: Optional[Dict[str, Any]] = None
 
 # Simple error response model
@@ -56,6 +63,15 @@ table_agent = None
 column_prune_agent = None
 query_generator = None
 
+# Replace intent_agent and table_agent initializations
+intent_table_agent = None
+
+def get_intent_table_agent():
+    global intent_table_agent
+    if intent_table_agent is None:
+        intent_table_agent = IntentAndTableAgent()
+    return intent_table_agent
+
 def get_intent_agent():
     global intent_agent
     if intent_agent is None:
@@ -79,12 +95,107 @@ def get_query_generator():
     if query_generator is None:
         query_generator = QueryPromptGenerator()
     return query_generator
-import time
+
+def oracle_date_syntax_fix(sql_query):
+    """Fix Oracle date interval syntax in the SQL query"""
+    # Fix MySQL DATE_SUB function to Oracle's ADD_MONTHS
+    date_sub_pattern = r'DATE_SUB\s*\(\s*CURRENT_DATE\s*,\s*INTERVAL\s+(\d+)\s+MONTH\s*\)'
+    sql_query = re.sub(date_sub_pattern, r'ADD_MONTHS(CURRENT_DATE, -\1)', sql_query)
+    
+    # Also handle a different pattern with DATE_SUB
+    date_sub_alt_pattern = r'DATE_SUB\s*\(\s*CURRENT_DATE\s*,\s*INTERVAL\s+(\d+)\s+MONTH\)'
+    sql_query = re.sub(date_sub_alt_pattern, r'ADD_MONTHS(CURRENT_DATE, -\1)', sql_query)
+    
+    # Handle standard interval pattern if DATE_SUB wasn't matched
+    date_interval_pattern = r'CURRENT_DATE\s*-\s*INTERVAL\s+(\d+)\s+MONTH'
+    sql_query = re.sub(date_interval_pattern, r'ADD_MONTHS(CURRENT_DATE, -\1)', sql_query)
+    
+    # Handle interval string patterns
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL '1 month'", "ADD_MONTHS(CURRENT_DATE, -1)")
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL '1 day'", "CURRENT_DATE - 1")
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL '7 day'", "CURRENT_DATE - 7")
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL '30 day'", "CURRENT_DATE - 30")
+    
+    # Handle interval keyword syntax
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL 1 DAY", "CURRENT_DATE - 1")
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL 7 DAY", "CURRENT_DATE - 7")
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL 30 DAY", "CURRENT_DATE - 30")
+    sql_query = sql_query.replace("CURRENT_DATE - INTERVAL 1 MONTH", "ADD_MONTHS(CURRENT_DATE, -1)")
+    
+    return sql_query
+
+def table_mapping_fix(sql_query):
+    """Fix table names based on schema"""
+    # Common table name mappings based on what users might ask for vs actual schema
+    common_mappings = {
+        "purchase_orders": "PO_NORM_TABLE_DUMMY",
+        "purchase_order_items": "PO_LINE_TABLE_DUMMY",
+        "purchase_order_invoices": "PO_INVOICE_DATA_DUMMY",
+        "purchase_requisitions": "PR_DATA_DUMMY",
+        "po": "PO_NORM_TABLE_DUMMY",
+        "po_items": "PO_LINE_TABLE_DUMMY",
+        "po_invoices": "PO_INVOICE_DATA_DUMMY",
+        "pr": "PR_DATA_DUMMY"
+    }
+    
+    # Apply the mappings
+    for common_name, schema_name in common_mappings.items():
+        # Replace full table name with schema name
+        sql_query = re.sub(
+            r'\b' + common_name + r'\b(?!\s+' + common_name + r'\b)',
+            schema_name,
+            sql_query
+        )
+        
+        # Fix table with alias pattern (e.g., "purchase_orders po" -> "PO_NORM_TABLE_DUMMY po")
+        for alias in ['po', 'poi', 'pr', 'inv']:
+            pattern = f"{common_name}\\s+{alias}\\b"
+            replacement = f"{schema_name} {alias}"
+            sql_query = re.sub(pattern, replacement, sql_query)
+    
+    # Clean up any duplicate aliases that got created in the transformation
+    for table in TABLES:
+        sql_query = re.sub(r'' + table + r'\s+' + table + r'\b', table, sql_query)
+    
+    return sql_query
+
+def clean_sql_for_oracle(sql_query):
+    """Clean and prepare SQL for Oracle execution"""
+    # Remove leading/trailing whitespace
+    sql_query = sql_query.strip()
+    
+    # Remove trailing semicolons which cause ORA-00911
+    if sql_query.endswith(';'):
+        sql_query = sql_query[:-1]
+    
+    # Handle markdown-formatted SQL 
+    if sql_query.startswith('```sql') and '```' in sql_query:
+        # Extract SQL from markdown code block
+        sql_parts = sql_query.split('```')
+        if len(sql_parts) >= 3:
+            sql_query = sql_parts[1]
+            # Remove the "sql" language identifier if present
+            if sql_query.lower().startswith('sql'):
+                sql_query = sql_query[3:]
+            sql_query = sql_query.strip()
+            if sql_query.endswith(';'):
+                sql_query = sql_query[:-1]
+    
+    # Fix Oracle date syntax
+    sql_query = oracle_date_syntax_fix(sql_query)
+    
+    # Fix table mappings based on schema
+    sql_query = table_mapping_fix(sql_query)
+    
+    # Fix column references if needed
+    # This could be expanded based on common issues with column names
+    
+    return sql_query
 
 @app.post("/generate_sql", response_model=QueryResponse, responses={500: {"model": ErrorResponse}})
 async def generate_sql(request: QueryRequest):
     """
-    Generate SQL from natural language query
+    Generate SQL from natural language query and execute it to return results
     """
     try:
         start_time = time.time()
@@ -92,26 +203,20 @@ async def generate_sql(request: QueryRequest):
         debug_mode = request.debug
         debug_info = {}
 
-        print("Step 1: Analyzing query intent")
-        step_start = time.time()
-        intent_agent = get_intent_agent()
-        intent_response = intent_agent.analyze_intent(user_query)
-        intent_data = extract_json_from_llm_response(intent_response)
-        if intent_data is None:
-            logger.warning("Failed to parse intent response JSON, using fallback")
-            intent_data = {
-                "operation_type": "SELECT",
-                "possible_tables": [],
-                "conditions": [],
-                "aggregations": [],
-                "intent_summary": user_query
-            }
-        print(f"Step 1 completed in {time.time() - step_start:.2f} seconds")
-
+        # Step 1 removed - Using default intent_data
+        intent_data = {
+            "operation_type": "SELECT",
+            "possible_tables": [],
+            "conditions": [],
+            "aggregations": [],
+            "intent_summary": user_query
+        }
         if debug_mode:
             debug_info["intent_analysis"] = intent_data
+            debug_info["available_tables"] = TABLES
+            debug_info["schemas"] = {table: load_schema(table) for table in TABLES}
 
-        logger.info("Step 2: Identifying relevant tables")
+        print("Step 2: Identifying relevant tables")
         step_start = time.time()
         table_agent = get_table_agent()
         tables_response = table_agent.identify_tables(intent_data)
@@ -123,7 +228,6 @@ async def generate_sql(request: QueryRequest):
                 "justification": "Fallback selection due to parsing error"
             }
         print(f"Step 2 completed in {time.time() - step_start:.2f} seconds")
-
         if debug_mode:
             debug_info["table_selection"] = tables_data
 
@@ -139,27 +243,30 @@ async def generate_sql(request: QueryRequest):
                 "justification": "Fallback selection due to parsing error"
             }
         print(f"Step 3 completed in {time.time() - step_start:.2f} seconds")
-
         if debug_mode:
             debug_info["column_selection"] = columns_data
 
         print("Step 4: Retrieving similar SQL examples")
         step_start = time.time()
         try:
-            similar_sql = retrieve_similar_sql(user_query)
+            if asyncio.iscoroutinefunction(retrieve_similar_sql):
+                similar_sql = await retrieve_similar_sql(user_query)
+            else:
+                similar_sql = retrieve_similar_sql(user_query)
         except Exception as e:
             logger.error(f"Error retrieving similar SQL: {str(e)}")
             similar_sql = []
         print(f"Step 4 completed in {time.time() - step_start:.2f} seconds")
-
         if debug_mode:
             debug_info["similar_sql"] = similar_sql
 
         print("Step 5: Generating SQL query")
         step_start = time.time()
         query_gen = get_query_generator()
+        schema_info = {table: load_schema(table) for table in tables_data.get("relevant_tables", [])}
         prompt_data = query_gen.generate_sql_prompt(
-            user_query, intent_data, tables_data, columns_data, similar_sql
+            user_query, intent_data, tables_data, columns_data, SQL_EXAMPLES,
+            schema_info=schema_info
         )
         sql_query = query_gen.generate_sql(prompt_data)
         if isinstance(sql_query, dict):
@@ -169,16 +276,26 @@ async def generate_sql(request: QueryRequest):
         if not isinstance(sql_query, str):
             raise TypeError(f"Expected a string, got {type(sql_query).__name__} instead.")
         print(f"Step 5 completed in {time.time() - step_start:.2f} seconds")
+        if debug_mode:
+            debug_info["sql_query"] = sql_query
 
         print("Step 6: Formatting SQL query")
         step_start = time.time()
         formatted_sql = format_sql_query(sql_query)
         print(f"Step 6 completed in {time.time() - step_start:.2f} seconds")
+        if debug_mode:
+            debug_info["formatted_sql"] = formatted_sql
+
+        original_sql = formatted_sql
 
         print("Step 7: Generating explanation")
         step_start = time.time()
         try:
-            explanation = query_gen.generate_explanation(user_query, formatted_sql)
+            if asyncio.iscoroutinefunction(query_gen.generate_explanation):
+                explanation = await query_gen.generate_explanation(user_query, formatted_sql)
+            else:
+                explanation = query_gen.generate_explanation(user_query, formatted_sql)
+
             if isinstance(explanation, dict):
                 explanation = explanation.get("text", "")
                 if not explanation:
@@ -189,16 +306,50 @@ async def generate_sql(request: QueryRequest):
             logger.error(f"Error generating explanation: {str(e)}")
             explanation = "An explanation could not be generated for this query."
         print(f"Step 7 completed in {time.time() - step_start:.2f} seconds")
+        if debug_mode:
+            debug_info["explanation"] = explanation
+
+        print("Step 8: Executing SQL query")
+        step_start = time.time()
+        query_results = []
+        try:
+            connection = get_connection()
+            cursor = connection.cursor()
+            try:
+                executable_sql = clean_sql_for_oracle(formatted_sql)
+                print(f"Executing cleaned SQL with mapped table names: {executable_sql}")
+                cursor.execute(executable_sql)
+                columns = [col[0] for col in cursor.description]
+                rows = cursor.fetchall()
+                for row in rows:
+                    result = {}
+                    for i, col in enumerate(columns):
+                        value = row[i]
+                        if isinstance(value, datetime):
+                            value = value.isoformat()
+                        result[col] = value
+                    query_results.append(result)
+            finally:
+                cursor.close()
+                connection.close()
+        except Exception as db_error:
+            logger.error(f"Database error: {str(db_error)}")
+            query_results = []
+            if debug_mode:
+                debug_info["query_execution_error"] = str(db_error)
+                debug_info["attempted_sql"] = executable_sql
+        print(f"Step 8 completed in {time.time() - step_start:.2f} seconds")
+        if debug_mode:
+            debug_info["query_results"] = query_results
 
         print(f"Total time taken: {time.time() - start_time:.2f} seconds")
 
-        # Log the query for auditing
         log_query(user_query, formatted_sql)
 
-        # Return the response
         return QueryResponse(
-            sql=formatted_sql,
+            sql=original_sql,
             explanation=explanation,
+            results=query_results,
             debug_info=debug_info if debug_mode else None
         )
 
@@ -209,8 +360,6 @@ async def generate_sql(request: QueryRequest):
             status_code=500,
             content={"error": "Error generating SQL", "details": str(e)}
         )
-
-from datetime import datetime
 
 @app.post("/execute_sql")
 async def execute_sql(request: Request):
@@ -233,8 +382,11 @@ async def execute_sql(request: Request):
             cursor = connection.cursor()
             
             try:
+                # Clean the SQL query for Oracle compatibility
+                executable_sql = clean_sql_for_oracle(sql_query)
+                
                 # Execute the query
-                cursor.execute(sql_query)
+                cursor.execute(executable_sql)
                 columns = [col[0] for col in cursor.description]
                 rows = cursor.fetchall()
                 
@@ -274,8 +426,22 @@ async def list_tables():
     """
     List available tables in the system
     """
-    return {"tables": TABLES}
+    return {"tables": TABLES, "schemas": {table: load_schema(table) for table in TABLES}}
+
+@app.get("/schema/{table_name}")
+async def get_table_schema(table_name: str):
+    """
+    Get schema for a specific table
+    """
+    schema = load_schema(table_name)
+    if schema == "No schema found.":
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Schema for table '{table_name}' not found"}
+        )
+    return {"table": table_name, "schema": schema}
 
 if __name__ == "__main__":
     import uvicorn
+    import time  # Add import for time module
     uvicorn.run(app, host="0.0.0.0", port=9002)
