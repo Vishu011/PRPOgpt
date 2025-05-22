@@ -9,6 +9,31 @@ The executed result from the database
 
 It supports dynamic schema loading, multi-table joins, and flexible scaling to new tables by automatically using metadata and vector-based semantic understanding.
 
+you config file should look something like this 
+# config.py
+
+# Oracle Cloud Info
+ENDPOINT = ""
+EMBEDDING_MODEL = ""
+GENERATE_MODEL = ""
+ORACLE_COMPARTMENT_ID = ""
+
+# Oracle DB Info
+DB_USER = ""
+DB_PWD = ""
+WALLET_DIR = ""
+WALLET_PWD = ""
+DSN = ""
+SCHEMA = ""
+
+# Source Tables & Corresponding Vector Stores
+TABLES = ["PO_INVOICE_DATA_DUMMY", "PO_LINE_TABLE_DUMMY", "PO_NORM_TABLE_DUMMY", "PR_DATA_DUMMY"]
+VECTOR_STORE_PO = "VECTOR_PO_NORM_TABLE_DUMMY"
+VECTOR_STORE_PR = "VECTOR_PR_DATA_DUMMY"
+VECTOR_STORE_LINE = "VECTOR_PO_LINE_TABLE_DUMMY"
+VECTOR_STORE_GRN = "VECTOR_PO_INVOICE_DATA_DUMMY"
+
+
 To run your QueryGPT API in Postman, you'll need to follow these steps:
 Step 1: Start Your API Server
 First, make sure your FastAPI server is running:
